@@ -1,7 +1,6 @@
 # Copyright (c) 2015, Frappe Technologies Pvt. Ltd. and Contributors
 # License: MIT. See LICENSE
 
-import _socket
 import datetime
 import email
 import email.utils
@@ -13,8 +12,8 @@ import ssl
 import time
 from contextlib import suppress
 from email.header import decode_header
-from urllib.parse import unquote
 
+import _socket
 import chardet
 from email_reply_parser import EmailReplyParser
 
@@ -69,10 +68,7 @@ class EmailServer:
 	def __init__(self, args=None):
 		self.retry_limit = 3
 		self.retry_count = 0
-
 		self.settings = args or frappe._dict()
-		self.pop_timeout = self.settings.timeout or frappe.conf.pop_timeout
-		self.imap_timeout = self.settings.timeout or frappe.conf.imap_timeout
 
 	def connect(self):
 		"""Connect to **Email Account**."""
@@ -85,12 +81,12 @@ class EmailServer:
 				self.imap = imaplib.IMAP4_SSL(
 					self.settings.host,
 					self.settings.incoming_port,
-					timeout=self.imap_timeout,
+					timeout=frappe.conf.pop_timeout,
 					ssl_context=ssl.create_default_context(),
 				)
 			else:
 				self.imap = imaplib.IMAP4(
-					self.settings.host, self.settings.incoming_port, timeout=self.imap_timeout
+					self.settings.host, self.settings.incoming_port, timeout=frappe.conf.pop_timeout
 				)
 
 				if cint(self.settings.use_starttls):
@@ -122,12 +118,12 @@ class EmailServer:
 				self.pop = poplib.POP3_SSL(
 					self.settings.host,
 					self.settings.incoming_port,
-					timeout=self.pop_timeout,
+					timeout=frappe.conf.pop_timeout,
 					context=ssl.create_default_context(),
 				)
 			else:
 				self.pop = poplib.POP3(
-					self.settings.host, self.settings.incoming_port, timeout=self.pop_timeout
+					self.settings.host, self.settings.incoming_port, timeout=frappe.conf.pop_timeout
 				)
 
 			if self.settings.use_oauth:
@@ -208,7 +204,12 @@ class EmailServer:
 			readonly = False if self.settings.email_sync_rule == "UNSEEN" else True
 
 			self.imap.select(folder, readonly=readonly)
-			_response, message = self.imap.uid("search", None, self.settings.email_sync_rule)
+			# ICD FIX: Sanitize sync rule - UID 0 is invalid in IMAP (rejected by Zoho)
+			sync_rule = self.settings.email_sync_rule
+			if sync_rule and sync_rule.startswith("UID 0"):
+				sync_rule = "UID 1" + sync_rule[5:]
+				self.settings.email_sync_rule = sync_rule
+			response, message = self.imap.uid("search", None, self.settings.email_sync_rule)
 			if message[0]:
 				email_list = message[0].split()
 		else:
@@ -220,7 +221,7 @@ class EmailServer:
 		# compare the UIDVALIDITY of email account and imap server
 		uid_validity = self.settings.uid_validity
 
-		_response, message = self.imap.status(folder, "(UIDVALIDITY UIDNEXT)")
+		response, message = self.imap.status(folder, "(UIDVALIDITY UIDNEXT)")
 		current_uid_validity = self.parse_imap_response("UIDVALIDITY", message[0]) or 0
 
 		uidnext = int(self.parse_imap_response("UIDNEXT", message[0]) or "1")
@@ -255,6 +256,8 @@ class EmailServer:
 
 			sync_count = 100 if uid_validity else int(self.settings.initial_sync_count)
 			from_uid = 1 if uidnext < (sync_count + 1) or (uidnext - sync_count) < 1 else uidnext - sync_count
+			# ICD FIX: IMAP UIDs start at 1, UID 0 is invalid and rejected by Zoho
+			from_uid = max(from_uid, 1)
 			# sync last 100 email
 			self.settings.email_sync_rule = f"UID {from_uid}:{uidnext}"
 			self.uid_reindexed = True
@@ -268,29 +271,14 @@ class EmailServer:
 		else:
 			return None
 
-	def retrieve_message(self, uid, msg_num, folder) -> None:
+	def retrieve_message(self, uid, msg_num, folder):
 		try:
 			if cint(self.settings.use_imap):
-				_status, data = self.imap.uid("fetch", uid, "(BODY.PEEK[] FLAGS)")
+				status, message = self.imap.uid("fetch", uid, "(BODY.PEEK[] BODY.PEEK[HEADER] FLAGS)")
+				raw = message[0]
 
-				if _status != "OK" or not data:
-					return
-
-				raw_email = next(
-					(part[1] for part in data if isinstance(part, tuple) and b"BODY[]" in part[0]), None
-				)
-
-				if raw_email is None:
-					return
-
-				flags_line = next(
-					(part for part in data if isinstance(part, bytes) and b"FLAGS" in part), None
-				)
-
-				if flags_line is not None:
-					self.get_email_seen_status(uid, flags_line)
-
-				self.latest_messages.append(raw_email)
+				self.get_email_seen_status(uid, raw[0])
+				self.latest_messages.append(raw[1])
 			else:
 				msg = self.pop.retr(msg_num)
 				self.latest_messages.append(b"\n".join(msg[1]))
@@ -440,27 +428,24 @@ class Email:
 
 	def set_subject(self):
 		"""Parse and decode `Subject` header."""
+		_subject = decode_header(self.mail.get("Subject", "No Subject"))
+		self.subject = _subject[0][0] or ""
 
-		raw_subject = self.mail.get("Subject")
-		if not raw_subject:
-			self.subject = "No Subject"
-			return
+		if charset := _subject[0][1]:
+			# Encoding is known by decode_header (might also be unknown-8bit)
+			self.subject = safe_decode(self.subject, charset, ALTERNATE_CHARSET_MAP)
 
-		decoded_fragments = []
-		for fragment, charset in decode_header(raw_subject):
-			if isinstance(fragment, bytes):
-				charset = charset or "utf-8"
-				try:
-					fragment = fragment.decode(charset, errors="replace")
-				except LookupError:
-					# Fallback to utf-8 if decoding fails
-					fragment = fragment.decode("utf-8", errors="replace")
-			decoded_fragments.append(fragment)
+		if isinstance(self.subject, bytes):
+			# Fall back to utf-8 if the charset is unknown or decoding fails
+			# Replace invalid characters with '<?>'
+			self.subject = self.subject.decode("utf-8", "replace")
 
-		subject = "".join(decoded_fragments).strip()
-
+		# Convert non-string (e.g. None)
 		# Truncate to 140 chars (can be used as a document name)
-		self.subject = subject[:140] if subject else "No Subject"
+		self.subject = str(self.subject).strip()[:140]
+
+		if not self.subject:
+			self.subject = "No Subject"
 
 	def set_from(self):
 		# gmail mailing-list compatibility
@@ -468,23 +453,14 @@ class Email:
 		_from_email = self.decode_email(self.mail.get("X-Original-From") or self.mail["From"])
 		_reply_to = self.decode_email(self.mail.get("Reply-To"))
 
-		if not _from_email:
-			# happens in some cases when email server is misconfigured
-			# should not fail the entire syncing process
-			frappe.log_error(
-				f"Email missing `From` header. UID: {getattr(self, 'uid', 'unknown')}", str(self.mail)
-			)
-			self.from_email = None
-			return
-
-		if _reply_to and not frappe.db.get_value(
-			"Email Account", {"email_id": _reply_to, "enable_incoming": 1}, "email_id"
-		):
+		if _reply_to and not frappe.db.get_value("Email Account", {"email_id": _reply_to}, "email_id"):
 			self.from_email = extract_email_id(_reply_to)
 		else:
 			self.from_email = extract_email_id(_from_email)
 
-		self.from_email = self.from_email.lower()
+		if self.from_email:
+			self.from_email = self.from_email.lower()
+
 		self.from_real_name = parse_addr(_from_email)[0] if "@" in _from_email else _from_email
 
 	@staticmethod
@@ -609,7 +585,7 @@ class Email:
 				_file = frappe.get_doc(
 					{
 						"doctype": "File",
-						"file_name": unquote(attachment["fname"]),
+						"file_name": attachment["fname"],
 						"attached_to_doctype": doc.doctype,
 						"attached_to_name": doc.name,
 						"is_private": 1,
@@ -636,7 +612,7 @@ class Email:
 	def get_thread_id(self):
 		"""Extract thread ID from `[]`"""
 		l = THREAD_ID_PATTERN.findall(self.subject)
-		return (l and l[0]) or None
+		return l and l[0] or None
 
 	def is_reply(self):
 		return bool(self.in_reply_to)
@@ -739,12 +715,7 @@ class InboundMail(Email):
 		if not self.message_id:
 			return
 
-		return Communication.find_one_by_filters(
-			message_id=self.message_id,
-			email_account=self.email_account.name,
-			sent_or_received="Received",
-			order_by="creation DESC",
-		)
+		return Communication.find_one_by_filters(message_id=self.message_id, order_by="creation DESC")
 
 	def is_sender_same_as_receiver(self):
 		return self.from_email == self.email_account.email_id
@@ -790,9 +761,7 @@ class InboundMail(Email):
 		if not self.is_reply():
 			return ""
 
-		communication = Communication.find_one_by_filters(
-			message_id=self.in_reply_to, order_by="creation DESC"
-		)
+		communication = Communication.find_one_by_filters(message_id=self.in_reply_to)
 		if not communication:
 			if self.parent_email_queue() and self.parent_email_queue().communication:
 				communication = Communication.find(self.parent_email_queue().communication, ignore_error=True)
@@ -815,24 +784,14 @@ class InboundMail(Email):
 			return self._reference_document
 
 		reference_document = ""
-		parent_email_queue = self.parent_email_queue()
-		parent_communication = self.parent_communication()
+		parent = self.parent_email_queue() or self.parent_communication()
 
-		parent = None
-		if parent_email_queue and parent_email_queue.reference_doctype:
-			parent = parent_email_queue
-		elif parent_communication and parent_communication.reference_doctype:
-			parent = parent_communication
-
-		if parent:
+		if parent and parent.reference_doctype:
 			reference_doctype, reference_name = parent.reference_doctype, parent.reference_name
 			reference_document = self.get_doc(reference_doctype, reference_name, ignore_error=True)
 
 		if not reference_document and self.email_account.append_to:
 			reference_document = self.match_record_by_subject_and_sender(self.email_account.append_to)
-
-		if not reference_document and self.is_reply_to_system_sent_mail():
-			reference_document = parent_communication
 
 		self._reference_document = reference_document or ""
 		return self._reference_document

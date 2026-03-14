@@ -87,15 +87,6 @@ frappe.views.CommunicationComposer = class {
 				fieldname: "send_after",
 			},
 			{
-				label: __("Use HTML"),
-				fieldtype: "Check",
-				fieldname: "use_html",
-				default: 0,
-				onchange: () => {
-					me.on_use_html_toggle();
-				},
-			},
-			{
 				fieldtype: "Section Break",
 				fieldname: "email_template_section_break",
 				hidden: 1,
@@ -123,13 +114,6 @@ frappe.views.CommunicationComposer = class {
 				label: __("Message"),
 				fieldtype: "Text Editor",
 				fieldname: "content",
-				onchange: frappe.utils.debounce(this.save_as_draft.bind(this), 300),
-			},
-			{
-				label: __("Message"),
-				fieldtype: "HTML Editor",
-				fieldname: "content_html",
-				hidden: 1,
 				onchange: frappe.utils.debounce(this.save_as_draft.bind(this), 300),
 			},
 			{
@@ -205,11 +189,31 @@ frappe.views.CommunicationComposer = class {
 				options: this.user_email_accounts,
 				onchange: () => {
 					this.setup_recipients_if_reply();
+					// ICD: Update CC when sender changes on Quotation
+					// Merges email threading customer CCs + sender-based CC
+					if (this._icd_init_done && this.frm && this.frm.doctype === "Quotation") {
+						let sender = this.dialog.get_value("sender") || "";
+						let icd_cc = sender === "sales@icd3s.com" ? "info@icd3s.com"
+							: sender.endsWith("@icloudist.com") ? "sales@icloudist.com" : "";
+						let cc_parts = [];
+						if (this.frm.doc.customer_cc_emails) {
+							cc_parts = this.frm.doc.customer_cc_emails.split(",").map(e => e.trim()).filter(e => e);
+						}
+						if (icd_cc && !cc_parts.includes(icd_cc)) {
+							cc_parts.push(icd_cc);
+						}
+						this.dialog.set_value("cc", cc_parts.join(", "));
+					}
 				},
 			});
 			//Preselect email senders if there is only one
 			if (this.user_email_accounts.length == 1) {
 				this["sender"] = this.user_email_accounts;
+			} else if (this.frm && this.frm.doctype === "Quotation"
+				&& this.frm.doc.sales_partner === "ICD Online"
+				&& this.user_email_accounts.includes("sales@icd3s.com")) {
+				this["sender"] = "sales@icd3s.com";
+				this["cc"] = "info@icd3s.com";
 			} else if (this.user_email_accounts.includes(frappe.session.user_email)) {
 				this["sender"] = frappe.session.user_email;
 			}
@@ -261,6 +265,7 @@ frappe.views.CommunicationComposer = class {
 	}
 
 	prepare() {
+		this._icd_init_done = false;
 		this.setup_multiselect_queries();
 		this.setup_subject_and_recipients();
 		this.setup_print();
@@ -411,7 +416,7 @@ frappe.views.CommunicationComposer = class {
 			if (!email_template) return;
 
 			function prepend_reply(reply) {
-				const content_field = me.get_content_field();
+				const content_field = me.dialog.fields_dict.content;
 				const subject_field = me.dialog.fields_dict.subject;
 
 				let content = content_field.get_value() || "";
@@ -442,7 +447,7 @@ frappe.views.CommunicationComposer = class {
 				label: __("Clear & Add Template"),
 				description: __("Clear the email message and add the template"),
 				action: () => {
-					me.set_email_content("");
+					me.dialog.fields_dict.content.set_value("");
 					add_template();
 				},
 			},
@@ -505,6 +510,23 @@ frappe.views.CommunicationComposer = class {
 			await this.dialog.set_value("email_template", email_template);
 		}
 
+		// ICD: Force correct CC for Quotation after all init
+		// Merges email threading customer CCs + sender-based CC
+		if (this.frm && this.frm.doctype === "Quotation") {
+			let sender = this.dialog.get_value("sender") || "";
+			let icd_cc = sender === "sales@icd3s.com" ? "info@icd3s.com"
+				: sender.endsWith("@icloudist.com") ? "sales@icloudist.com" : "";
+			let cc_parts = [];
+			if (this.frm.doc.customer_cc_emails) {
+				cc_parts = this.frm.doc.customer_cc_emails.split(",").map(e => e.trim()).filter(e => e);
+			}
+			if (icd_cc && !cc_parts.includes(icd_cc)) {
+				cc_parts.push(icd_cc);
+			}
+			await this.dialog.set_value("cc", cc_parts.join(", "));
+			this._icd_init_done = true;
+		}
+
 		for (const fieldname of ["email_template", "cc", "bcc"]) {
 			if (this.dialog.get_value(fieldname)) {
 				this.toggle_more_options(true);
@@ -517,7 +539,7 @@ frappe.views.CommunicationComposer = class {
 		if (this.message) return;
 
 		const last_edited = this.get_last_edited_communication();
-		if (!last_edited.content && !last_edited.content_html) return;
+		if (!last_edited.content) return;
 
 		// prevent re-triggering of email template
 		if (last_edited.email_template) {
@@ -740,24 +762,18 @@ frappe.views.CommunicationComposer = class {
 
 	save_as_draft() {
 		if (this.dialog && this.frm) {
-			let message = this.get_email_content();
+			let message = this.dialog.get_value("content");
 			message = message.split(separator_element)[0];
-			this.save_item_in_local_forage(this.frm.doctype + this.frm.docname, message);
-			this.save_item_in_local_forage(
-				this.frm.doctype + this.frm.docname + "_use_html",
-				this.dialog.get_value("use_html")
-			);
+			localforage.setItem(this.frm.doctype + this.frm.docname, message).catch((e) => {
+				if (e) {
+					// silently fail
+					console.log(e);
+					console.warn(
+						"[Communication] IndexedDB is full. Cannot save message as draft"
+					); // eslint-disable-line
+				}
+			});
 		}
-	}
-
-	save_item_in_local_forage(key, value) {
-		localforage.setItem(key, value).catch((e) => {
-			if (e) {
-				// silently fail
-				console.log(e);
-				console.warn("[Communication] IndexedDB is full. Cannot save communication draft"); // eslint-disable-line
-			}
-		});
 	}
 
 	clear_cache() {
@@ -783,8 +799,8 @@ frappe.views.CommunicationComposer = class {
 		const me = this;
 		this.dialog.hide();
 
-		if (!form_values.recipients && !form_values.cc && !form_values.bcc) {
-			frappe.msgprint(__("Enter Email Recipient(s) in the To, CC, or BCC fields"));
+		if (!form_values.recipients) {
+			frappe.msgprint(__("Enter Email Recipient(s)"));
 			return;
 		}
 
@@ -805,7 +821,7 @@ frappe.views.CommunicationComposer = class {
 				cc: form_values.cc,
 				bcc: form_values.bcc,
 				subject: form_values.subject,
-				content: me.get_email_content(),
+				content: form_values.content,
 				doctype: me.doc.doctype,
 				name: me.doc.name,
 				send_email: 1,
@@ -820,7 +836,6 @@ frappe.views.CommunicationComposer = class {
 				print_letterhead: me.is_print_letterhead_checked(),
 				send_after: form_values.send_after ? form_values.send_after : null,
 				print_language: form_values.print_language,
-				in_reply_to: (this.is_a_reply && this.last_email?.name) || null,
 			},
 			btn,
 			callback(r) {
@@ -886,8 +901,6 @@ frappe.views.CommunicationComposer = class {
 		if (!message && this.frm) {
 			const { doctype, docname } = this.frm;
 			message = (await localforage.getItem(doctype + docname)) || "";
-			const use_html = (await localforage.getItem(doctype + docname + "_use_html")) || 0;
-			await this.dialog.set_value("use_html", use_html);
 		}
 
 		if (message) {
@@ -903,7 +916,7 @@ frappe.views.CommunicationComposer = class {
 			message += this.get_earlier_reply();
 		}
 
-		await this.set_email_content(message);
+		await this.dialog.set_value("content", message);
 	}
 
 	async get_signature(sender_email) {
@@ -998,28 +1011,5 @@ frappe.views.CommunicationComposer = class {
 
 		const text = frappe.utils.html2text(html);
 		return text.replace(/\n{3,}/g, "\n\n");
-	}
-
-	get_content_field() {
-		const use_html = this.dialog.get_value("use_html");
-		return use_html ? this.dialog.fields_dict.content_html : this.dialog.fields_dict.content;
-	}
-
-	get_email_content() {
-		return this.get_content_field().get_value() || "";
-	}
-
-	set_email_content(value) {
-		return this.get_content_field().set_value(value);
-	}
-
-	on_use_html_toggle() {
-		this.save_as_draft();
-		const use_html = this.dialog.get_value("use_html");
-
-		this.dialog.set_df_property("content", "hidden", use_html);
-		this.dialog.set_df_property("content_html", "hidden", !use_html);
-
-		this.dialog.set_value("email_template", "");
 	}
 };

@@ -1,0 +1,95 @@
+import frappe
+import json
+
+def run():
+    """Create 79 Leads from wrong Customers - distribute to 4 sales partners"""
+
+    # Step 1: Disable auto_creation_of_contact
+    print("Step 1: Disabling auto_creation_of_contact...")
+    original_value = frappe.db.get_single_value("CRM Settings", "auto_creation_of_contact")
+    frappe.db.set_value("CRM Settings", "CRM Settings", "auto_creation_of_contact", 0)
+    frappe.db.commit()
+    print(f"  Original value: {original_value}, Now: 0")
+
+    try:
+        # Step 2: Load leads data
+        with open('/tmp/79_leads_to_create.json', 'r') as f:
+            leads = json.load(f)
+
+        print(f"\nStep 2: Creating {len(leads)} Leads...")
+
+        created = 0
+        skipped = 0
+        failed = []
+
+        partner_counts = {"Fatma": 0, "Naira": 0, "Nehal": 0, "Rabab": 0}
+
+        for lead in leads:
+            phone = lead['phone']
+            lead_name = lead['lead_name']
+            sales_partner = lead['sales_partner']
+
+            # Check if lead already exists with this phone
+            existing = frappe.db.exists("Lead", {"mobile_no": phone})
+            if existing:
+                skipped += 1
+                continue
+
+            # Parse name for first/last name
+            name_parts = lead_name.split() if lead_name else [f"WA-{phone}"]
+            first_name = name_parts[0] if name_parts else f"WA-{phone}"
+            last_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else "WA"
+
+            try:
+                doc = frappe.get_doc({
+                    "doctype": "Lead",
+                    "first_name": first_name,
+                    "last_name": last_name,
+                    "lead_name": lead_name or f"WA-{phone}",
+                    "mobile_no": phone,
+                    "source": "WhatsApp",
+                    "status": "Lead",
+                    "sales_partner": sales_partner,
+                    "company": "ICD",
+                    "territory": "Egypt"
+                })
+                doc.flags.ignore_permissions = True
+                doc.flags.ignore_links = True
+                doc.flags.ignore_mandatory = True
+                doc.insert()
+
+                created += 1
+                partner_counts[sales_partner] += 1
+
+                if created % 20 == 0:
+                    frappe.db.commit()
+                    print(f"  Progress: {created} leads created...")
+
+            except Exception as e:
+                failed.append({"name": lead_name, "phone": phone, "error": str(e)[:100]})
+
+        frappe.db.commit()
+
+        print(f"\n{'='*50}")
+        print(f"LEADS CREATION COMPLETE")
+        print(f"{'='*50}")
+        print(f"Created: {created}")
+        print(f"Skipped (exist): {skipped}")
+        print(f"Failed: {len(failed)}")
+        print(f"\nDistribution:")
+        for partner, count in partner_counts.items():
+            print(f"  {partner}: {count}")
+
+        if failed:
+            print("\nFailed items:")
+            for f in failed[:10]:
+                print(f"  - {f['name']} ({f['phone']}): {f['error']}")
+
+    finally:
+        # Step 3: Re-enable auto_creation_of_contact
+        print(f"\nStep 3: Re-enabling auto_creation_of_contact...")
+        frappe.db.set_value("CRM Settings", "CRM Settings", "auto_creation_of_contact", original_value)
+        frappe.db.commit()
+        print(f"  Restored to: {original_value}")
+
+    return created

@@ -157,7 +157,6 @@ class EmailAccount(Document):
 		if not frappe.local.flags.in_install and not self.awaiting_password:
 			if validate_oauth or self.password or self.smtp_server in ("127.0.0.1", "localhost"):
 				if self.enable_incoming:
-					self.flags.validate_imap_pop_connection = True
 					self.get_incoming_server()
 					self.no_failed = 0
 
@@ -185,9 +184,8 @@ class EmailAccount(Document):
 		if not self.smtp_server:
 			frappe.throw(_("SMTP Server is required"))
 
-		self.flags.validate_smtp_connection = True
-		self.get_smtp_server().session
-		del self._smtp_server_instance
+		server = self.get_smtp_server()
+		return server.session
 
 	def before_save(self):
 		messages = []
@@ -273,9 +271,6 @@ class EmailAccount(Document):
 
 		if not args.get("host"):
 			frappe.throw(_("{0} is required").format("Email Server"))
-
-		if self.flags.validate_imap_pop_connection:
-			args.timeout = 15
 
 		email_server = EmailServer(frappe._dict(args))
 		self.check_email_server_connection(email_server, in_receive)
@@ -480,7 +475,7 @@ class EmailAccount(Document):
 	def sendmail_config(self):
 		oauth_token = self.get_oauth_token()
 
-		config = {
+		return {
 			"email_account": self.name,
 			"server": self.smtp_server,
 			"port": cint(self.smtp_port),
@@ -491,11 +486,6 @@ class EmailAccount(Document):
 			"use_oauth": self.auth_method == "OAuth",
 			"access_token": oauth_token.get_password("access_token") if oauth_token else None,
 		}
-
-		if self.flags.validate_smtp_connection:
-			config["timeout"] = 15
-
-		return config
 
 	def get_smtp_server(self):
 		"""Get SMTPServer (wrapper around actual smtplib object) for this account.
@@ -708,9 +698,10 @@ class EmailAccount(Document):
 			return "UNSEEN"
 
 		if self.email_sync_option == "ALL":
-			max_uid = get_max_email_uid(self.name)
+			max_uid = max(get_max_email_uid(self.name) or 0, 1)
 			last_uid = max_uid + int(self.initial_sync_count or 100) if max_uid == 1 else "*"
-			return f"UID {max_uid}:{last_uid}"
+			# ICD FIX: Ensure UID never starts at 0 (invalid in IMAP, rejected by Zoho)
+			return f"UID {max(max_uid, 1)}:{last_uid}"
 		else:
 			return self.email_sync_option or "UNSEEN"
 
@@ -906,7 +897,7 @@ def get_max_email_uid(email_account):
 		},
 		fields=["max(uid) as uid"],
 	):
-		return cint(result[0].get("uid", 0)) + 1
+		return max(cint(result[0].get("uid", 0)) + 1, 1)
 	return 1
 
 
